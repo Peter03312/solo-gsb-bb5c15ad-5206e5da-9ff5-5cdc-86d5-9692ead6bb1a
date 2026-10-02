@@ -1,7 +1,7 @@
 """Pydantic 请求 / 响应模型。"""
 from typing import Optional
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from . import config
 
@@ -242,6 +242,31 @@ class TripOut(BaseModel):
     arrival_minute: int
     itinerary: list[LegOut]
     confirmed_at: str
+    # 以下作废字段为后续轮次新增；未作废行程均为 null，旧消费方读取不受影响
+    voided: bool = Field(default=False, description="该行程是否已作废")
+    void_reason: Optional[str] = Field(
+        default=None, description="作废原因；未作废为 null"
+    )
+    voided_at: Optional[str] = Field(
+        default=None, description="作废时间；未作废为 null"
+    )
+
+
+# ---- 行程作废 ---------------------------------------------------------------------
+
+class TripVoidRequest(BaseModel):
+    # 空串/缺失由 min_length 兜底为 VALIDATION_ERROR；纯空白由路由层显式校验，
+    # 避免 pydantic 校验器的 ctx 携带不可 JSON 序列化的异常对象
+    reason: str = Field(
+        min_length=1,
+        description="非空作废原因（去除首尾空白后仍须非空）；重复作废不覆盖首次原因",
+    )
+
+
+class TripVoidOut(BaseModel):
+    trip_id: int = Field(description="被作废的行程号")
+    reason: str = Field(description="作废原因（重复作废返回首次原因）")
+    voided_at: str = Field(description="首次作废时间")
 
 
 # ---- 潮位更正后的复核 / 改期 -------------------------------------------------------

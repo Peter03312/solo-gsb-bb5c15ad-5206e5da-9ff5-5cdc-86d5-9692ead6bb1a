@@ -87,6 +87,16 @@ CREATE TABLE IF NOT EXISTS channel_group_members (
     position   INTEGER NOT NULL,                                    -- 提交集合中的次序（0 起）
     PRIMARY KEY (group_id, seg_id)
 );
+
+-- 行程作废：调度员误确认后凭非空原因将已确认行程作废。
+-- 与 confirmed_trips 一对一：行程快照本身原样保留（历史快照可查），作废只使
+-- 其按固化航时计算的航段/狭窄水道组占用从后续调度中失效（见 planning.load_occupancy
+-- 的 LEFT JOIN 过滤）。重复作废返回首次记录（由主键保证只有一行）。
+CREATE TABLE IF NOT EXISTS trip_voids (
+    trip_id     INTEGER PRIMARY KEY REFERENCES confirmed_trips(trip_id),
+    reason      TEXT NOT NULL,                  -- 非空作废原因
+    voided_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

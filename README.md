@@ -62,6 +62,21 @@
 同键重放语义不变）。**改期建议**须避开其他快照的组占用并排除自身，而原行程
 **安全复核仍只判断潮位**。旧接口路径与字段完全不变。
 
+**本轮新增行程作废**：调度员**误确认**行程后，可凭**行程号 + 非空作废原因**
+将已确认行程作废（`POST /api/trips/{trip_id}/void`），返回**行程号、原因、
+作废时间**；作废记录可按行程号查询（`GET /api/trips/{trip_id}/void`），未知
+行程报 `404 TRIP_NOT_FOUND`，行程存在但未作废报 `404 VOID_RECORD_NOT_FOUND`；
+**重复作废幂等返回首次记录**（HTTP 200）且**不覆盖**首次原因。已确认行程
+快照与原批次确认结果**仍作为历史快照可查**（`GET /api/trips`、
+`GET /api/trips/{id}` 新增 `voided / void_reason / voided_at` 字段，未作废均为
+`false / null / null`），作废**只使该行程按固化航时计算的航段及狭窄水道组
+展开占用从后续调度中失效**。单船与批次的**预排、确认复算**以及**改期建议**
+均只避开**仍有效**的快照；作废与确认的状态变更和复算都在
+`BEGIN IMMEDIATE` 事务中串行，**不得产生相互重叠的有效确认行程**。已作废批次
+行程的**原幂等键重放**仍返回首次确认结果（`replayed=true`、行程号不变，
+**不重新产生占用**）；原行程的**潮位安全复核仍按历史快照执行**。旧接口路径、
+请求、响应与错误语义保持兼容。
+
 ---
 
 ## 1. 启动
@@ -189,6 +204,39 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
     快照（`exclude_trip_id`），而**原行程潮位安全复核完全不读取占用/组关系**。
     查询：`GET /api/channel-groups`（全量）、`GET /api/channel-groups/{id}`
     （详情，未知组 `404 CHANNEL_GROUP_NOT_FOUND`）。
+- **行程作废（误确认纠正，不改写历史快照）**：
+  - 调度员凭**行程号 + 非空作废原因**作废（`POST /api/trips/{trip_id}/void`），
+    成功返回 `201` 与 `{trip_id, reason, voided_at}`；原因为空串/纯空白 ->
+    `422 VALIDATION_ERROR`；未知行程 -> `404 TRIP_NOT_FOUND`。
+  - 作废记录可按行程号查询（`GET /api/trips/{trip_id}/void`）：行程存在但
+    **未作废** -> `404 VOID_RECORD_NOT_FOUND`；**重复作废**幂等返回
+    **首次记录**（HTTP 200、首次原因与首次作废时间，**不覆盖**）。
+  - **历史快照仍可查**：作废**不删除、不改写** `confirmed_trips` 快照；
+    `GET /api/trips` 与 `GET /api/trips/{id}` 继续列出已作废行程，新增
+    `voided`（布尔）、`void_reason`、`voided_at` 三个字段（未作废为
+    `false/null/null`，旧消费方无感知）。
+  - **占用失效口径**：作废只使该行程按快照中各段**固化 `travel_time`**
+    （`d..d+t-1`）计算的航段占用，以及该占用经**当前狭窄水道组关系**的整组
+    展开，从**后续调度**中消失（实现为 `load_occupancy` 对 `trip_voids`
+    `LEFT JOIN` 后只取未作废快照）。快照本身与其历史确认结果均不变。
+  - **只影响后续调度**：单船 `/api/trips/plan`、批次
+    `/api/trips/batch/plan`（预排只读）、单船 `/api/trips/confirm` 与批次
+    `/api/trips/batch/confirm` 的事务内**确认复算**、以及复核后的**改期建议**
+    （`exclude_trip_id` 口径不变），都只避开**仍有效**（未作废）的快照；
+    作废后立刻可规划/复算出复用这些分钟的新行程。
+  - **潮位安全复核不变**：`POST /api/trips/{id}/review` 对已作废行程仍按其
+    **历史快照原占用分钟**判潮位（不读取占用/作废状态），改期建议同样只读、
+    不占位。
+  - **批次幂等重放不变**：已作废批次行程的**原幂等键**重放仍返回
+    `batch_confirmations` 中登记的**首次确认结果**（同行程号、`replayed=true`），
+    **不重新复算、不新增快照、不重新产生占用**；同键异内容仍为
+    `BATCH_KEY_CONFLICT`。
+  - **并发串行**：作废与单船/批次确认都在单个 `BEGIN IMMEDIATE` 写事务中
+    完成；SQLite 写锁使「插入作废记录」与「读取占用 + 复算 + 写入快照」
+    严格串行——确认先持锁则复算仍计入旧占用（避让提交通过、重叠被拒），
+    作废先提交则确认复算已看不到该占用（旧的避让提交按
+    `409 PLAN_MISMATCH` 拒绝）。任一顺序下都**不会产生相互重叠的有效确认
+    行程**。
   每个修订的逐分钟数据含**名义潮位 `level`** 与**非负预测误差
   `error`（米）**，真实潮位落在 `[level−error, level+error]`。占用的**每一分钟**都
   必须同时满足（按误差带取对应极值）：
@@ -301,12 +349,33 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 狭窄水道组含未知航段 | 404 | `SEGMENT_NOT_FOUND`（`details.unknown_seg_ids`，不组建） |
 | 狭窄水道组成员已归属某组（含并发竞争） | 409 | `SEGMENT_ALREADY_GROUPED`（不组建、旧组不变） |
 | 查询的狭窄水道组不存在 | 404 | `CHANNEL_GROUP_NOT_FOUND` |
+| 作废未知行程（作废/查作废记录） | 404 | `TRIP_NOT_FOUND` |
+| 行程存在但未作废，查询其作废记录 | 404 | `VOID_RECORD_NOT_FOUND` |
+| 作废原因为空串或纯空白 | 422 | `VALIDATION_ERROR` |
 
 ---
 
 ## 3. HTTP API
 
-> **本轮用法（狭窄水道组）**：新增三个只读/登记端点，旧 API 路径与请求/响应
+> **本轮用法（行程作废）**：调度员误确认后可作废行程，旧 API 路径与请求/响应
+> 结构保持兼容（`GET /api/trips` 仅新增三个带默认值的作废字段）——
+> - `POST /api/trips/{trip_id}/void`：提交**非空作废原因** `{"reason": "..."}`，
+>   首次作废 `201` 返回 `{trip_id, reason, voided_at}`；重复作废 `200` 幂等返回
+>   **首次记录**且不覆盖原因；未知行程 `404 TRIP_NOT_FOUND`；空串/纯空白原因
+>   `422 VALIDATION_ERROR`；
+> - `GET /api/trips/{trip_id}/void`：按行程号查询作废记录；未知行程
+>   `404 TRIP_NOT_FOUND`，已确认但未作废 `404 VOID_RECORD_NOT_FOUND`；
+> - 已确认行程与原批次确认结果**仍作为历史快照可查**
+>   （`GET /api/trips` / `GET /api/trips/{id}` 新增 `voided/void_reason/voided_at`，
+>   未作废为 `false/null/null`）；作废只使该行程按**固化航时**的航段占用及
+>   **狭窄水道组展开**占用从后续调度失效——单船/批次预排、确认复算与改期建议
+>   均只避开仍有效的快照；
+> - 作废与确认的状态变更和复算均在 `BEGIN IMMEDIATE` 事务中串行，不会产生
+>   相互重叠的有效确认行程；
+> - 已作废批次行程的**原幂等键重放**仍返回首次确认结果（不重新产生占用）；
+>   `POST /api/trips/{id}/review` 的原行程潮位安全复核仍按历史快照执行。
+>
+> **上一轮用法（狭窄水道组）**：新增三个只读/登记端点，旧 API 路径与请求/响应
 > 结构完全不变；组建成即不可变，所有规划/确认/批次/改期自动按当前组关系工作——
 > - `POST /api/channel-groups`：提交**航段编号集合**（至少 2 条）登记狭窄水道组，
 >   返回 `group_id` 与按提交次序排列的 `members`（含航段起终点/基础航时/水深/净空）；
@@ -375,8 +444,10 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/trips/batch/plan` | **本轮新增**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船拟占用） |
 | POST | `/api/trips/batch/confirm` | **本轮新增**：携带修订号 + 幂等键批次确认（事务逐艘复算，全成全败、幂等重放） |
 | POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期 |
-| GET | `/api/trips` | 已确认行程列表 |
-| GET | `/api/trips/{trip_id}` | 已确认行程快照详情 |
+| POST | `/api/trips/{trip_id}/void` | **本轮新增**：凭非空作废原因作废误确认行程（首次 201；重复作废 200 返回首次记录、不覆盖原因；快照保留、占用失效） |
+| GET | `/api/trips/{trip_id}/void` | **本轮新增**：按行程号查询作废记录（行程存在但未作废 `VOID_RECORD_NOT_FOUND`） |
+| GET | `/api/trips` | 已确认行程列表（含已作废历史快照，带 `voided/void_reason/voided_at`） |
+| GET | `/api/trips/{trip_id}` | 已确认行程快照详情（已作废同样可查，带作废标记） |
 | GET | `/health` | 健康检查 |
 
 ### 预测误差修订请求 / 响应示例
@@ -509,6 +580,62 @@ POST /api/channel-groups
 航段 2（先船的**抵达分钟即可进入**），而组外的航段 3（C→D）不受影响、
 第 0 分钟仍可进入。组建前已确认、经过组内任一航段的快照也按其固化航时
 同样展开（快照本身不改写）。
+
+### 行程作废请求 / 响应示例（本轮新增）
+
+调度员发现行程误确认后，凭**行程号 + 非空作废原因**作废：
+
+```json
+POST /api/trips/1/void
+{ "reason": "调度员误确认：该船改期至下一时段" }
+```
+
+首次作废返回 `201`：
+
+```json
+{
+  "trip_id": 1,
+  "reason": "调度员误确认：该船改期至下一时段",
+  "voided_at": "2026-10-02 15:40:28"
+}
+```
+
+- 重复作废（即使原因不同）幂等返回 **HTTP 200** 与**首次记录**，首次原因与
+  作废时间**均不被覆盖**：
+
+```bash
+curl -s -i -X POST $BASE/api/trips/1/void \
+  -H 'Content-Type: application/json' -d '{"reason":"想换成另一个原因"}'
+# HTTP/1.1 200 OK
+# {"trip_id":1,"reason":"调度员误确认：该船改期至下一时段","voided_at":"2026-10-02 15:40:28"}
+```
+
+- 查询作废记录：`GET /api/trips/1/void`（响应同上）；
+  - 未知行程（从未确认）-> `404 TRIP_NOT_FOUND`；
+  - 行程存在但未作废 -> `404 VOID_RECORD_NOT_FOUND`；
+  - 作废原因为空串或纯空白 -> `422 VALIDATION_ERROR`（不产生作废记录）。
+- 作废后 `GET /api/trips/1` 仍读到完整历史快照，新增字段标识作废态：
+
+```json
+{
+  "trip_id": 1, "revision": 1, "origin": "A", "destination": "D",
+  "arrival_minute": 90, "itinerary": [ /* 与确认时完全一致的固化行程 */ ],
+  "confirmed_at": "2026-10-02 15:30:11",
+  "voided": true,
+  "void_reason": "调度员误确认：该船改期至下一时段",
+  "voided_at": "2026-10-02 15:40:28"
+}
+```
+
+未作废行程的三个字段为 `voided=false / void_reason=null / voided_at=null`。
+
+**作废的调度效果**：作废只释放该行程按各段**固化航时** `d..d+t-1` 计算的
+航段占用（及其狭窄水道组整组展开），快照本身不改写。例如作废一条
+`A→B→C→D`、0 分出发 90 分抵达的行程后，再对同航路做
+`POST /api/trips/plan`，最早出发分钟重新回到 0；用作废前避让占用得到的旧
+规划结果去确认，事务复算发现提交行程已不再是最优 -> `409 PLAN_MISMATCH`。
+批次原幂等键重放仍返回首次结果（含已作废成员的原行程号、`replayed=true`，
+不新增占用）；已作废行程的 `review` 潮位安全复核仍按历史快照原占用执行。
 
 ### 规划请求 / 响应示例
 
@@ -753,6 +880,21 @@ curl -s -i -X POST $BASE/api/channel-groups -H 'Content-Type: application/json' 
 
 # 组建后规划自动按整组独占避让（只读不占位）；确认/批次确认在事务内按
 # 当前组关系复算，组建后用旧规划结果确认 -> 409 PLAN_MISMATCH（批次整批回滚）
+
+# 0c) 本轮新增：作废误确认的已确认行程（历史快照保留，占用立即从后续调度失效）
+curl -s -X POST $BASE/api/trips/1/void \
+  -H 'Content-Type: application/json' -d '{"reason":"调度员误确认，改至下一时段"}'
+# {"trip_id":1,"reason":"...","voided_at":"2026-10-02 15:40:28"}
+# 查询作废记录（未作废 -> 404 VOID_RECORD_NOT_FOUND；未知行程 -> 404 TRIP_NOT_FOUND）
+curl -s $BASE/api/trips/1/void
+# 重复作废：HTTP 200 + 首次记录（原因不覆盖）
+curl -s -i -X POST $BASE/api/trips/1/void \
+  -H 'Content-Type: application/json' -d '{"reason":"第二次原因"}' | head -1
+# 作废后历史快照仍在（voided=true），但同航路重新规划已能复用其原占用分钟
+curl -s $BASE/api/trips/1
+curl -s -X POST $BASE/api/trips/plan -H 'Content-Type: application/json' \
+  -d '{"origin":"A","destination":"D","start_minute":0,"window_minutes":1440,
+       "draft":5.0,"height":2.0,"margin":0.5,"revision":1}'
 
 # 0b) 上一轮新增：为航段 2 设置分时航时管制（整组替换；空组 [] 恢复基础航时）
 #    [0,360) 内进入航时 60 分钟，[360,720) 内进入航时 45 分钟，其余分钟用基础航时
@@ -1002,6 +1144,40 @@ ships = [
 # assert confirm.json()["error"]["code"] == "PLAN_MISMATCH"
 ```
 
+Python 示例（确认 → 误确认作废 → 占用释放 → 历史快照仍可查）：
+
+```python
+import requests
+
+B = "http://localhost:8000"
+body = {"origin": "A", "destination": "D", "start_minute": 0,
+        "window_minutes": 1440, "draft": 5.0, "height": 2.0, "margin": 0.5}
+
+# 1) 规划并确认
+plan = requests.post(f"{B}/api/trips/plan", json=body).json()
+trip = requests.post(f"{B}/api/trips/confirm", json=plan).json()
+tid = trip["trip_id"]
+
+# 2) 发现误确认：凭行程号 + 非空原因作废
+r = requests.post(f"{B}/api/trips/{tid}/void",
+                  json={"reason": "调度员误确认，该船改至下一时段"})
+assert r.status_code == 201
+print(r.json())  # {'trip_id': ..., 'reason': '...', 'voided_at': '...'}
+
+# 3) 重复作废：幂等返回首次记录（200），原因不覆盖
+again = requests.post(f"{B}/api/trips/{tid}/void", json={"reason": "另一个原因"})
+assert again.status_code == 200 and again.json() == r.json()
+
+# 4) 查询作废记录；未知行程 TRIP_NOT_FOUND，未作废 VOID_RECORD_NOT_FOUND
+print(requests.get(f"{B}/api/trips/{tid}/void").json())
+
+# 5) 历史快照仍在，只是带作废标记；同航路重新规划可立即复用其原占用分钟
+snap = requests.get(f"{B}/api/trips/{tid}").json()
+assert snap["voided"] is True and snap["itinerary"] == trip["itinerary"]
+new_plan = requests.post(f"{B}/api/trips/plan", json=body).json()
+print("作废后最早抵达", new_plan["arrival_minute"])  # 回到 90（未避让作废行程）
+```
+
 录入自定义数据：
 
 ```bash
@@ -1017,9 +1193,10 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 窗口不超过 1440 分钟，采用**时间展开动态规划**（实现见 `app/services/planning.py`）：
 
 1. 校验节点与修订；取窗口内全部名义潮位与预测误差，任一分钟缺名义潮位立即报
-   `MISSING_TIDE_DATA`；同时读取窗口内全部已确认快照的航段占用
-   （`load_occupancy`，既有快照彼此重叠也原样计入，并按当前狭窄水道组关系
-   展开为整组占用）与各航段的分时航时管制（`load_controls`）；
+   `MISSING_TIDE_DATA`；同时读取窗口内全部**未作废**已确认快照的航段占用
+   （`load_occupancy`，经 `trip_voids` LEFT JOIN 过滤；既有快照彼此重叠也
+   原样计入，并按当前狭窄水道组关系展开为整组占用）与各航段的分时航时管制
+   （`load_controls`）；
 2. 对每条航段用"不可行分钟前缀和"预处理：任意进入分钟先按管制选定**实际航时**
    （进入分钟命中区间取该区间通行分钟，否则取基础航时；途中跨边界不变），再判定
    该实际航程是否全程满足误差带约束（水深 `深度+名义−误差`、净空
@@ -1057,6 +1234,33 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 5. 复核改期以 `load_occupancy(exclude_trip_id=本行程)` 读占用，故只避开
    **其他**快照的组占用、排除自身；原航路潮位复核 `_check_original` 完全不
    读取占用与组关系，口径仍为只判潮位误差带。
+
+### 行程作废（实现见 `app/services/voids.py`）
+
+1. 建表一张：`trip_voids(trip_id PK REFERENCES confirmed_trips, reason NOT
+   NULL, voided_at)`。与快照**一对一**：主键保证每个行程至多一条作废记录，
+   服务层先在 `BEGIN IMMEDIATE` 事务内查存在性（未知行程
+   `TRIP_NOT_FOUND`）、再查既有作废记录——命中则 `COMMIT` 后原样返回首次
+   记录（重复作废幂等、不更新 `reason/voided_at`），否则插入并返回
+   `201`。原因为空串/纯空白在路由层返回 `422 VALIDATION_ERROR`，不落库。
+2. **快照不改写、占用失效**：`planning.load_occupancy` 读取占用时对
+   `trip_voids` 做 `LEFT JOIN`，仅纳入 `v.trip_id IS NULL` 的有效快照；
+   狭窄水道组展开只对仍有效快照的原占用（固化 `travel_time`）取闭包，
+   因此作废一条行程即同时释放其航段占用与组展开占用。`confirmed_trips`
+   行及其 JSON 快照原样保留，`GET /api/trips`/`GET /api/trips/{id}` 经
+   `LEFT JOIN` 回带 `voided/void_reason/voided_at`（未作废为
+   `false/null/null`）。
+3. **影响面**：单船/批次预排、单船/批次确认事务内复算、改期建议
+   （`reschedule` 的 `load_occupancy(exclude_trip_id=...)`）全部经由同一
+   `load_occupancy`，天然只避开仍有效的快照；原行程潮位安全复核
+   `_check_original` 不读作废状态、仍按历史快照执行；批次确认重放直接返回
+   `batch_confirmations.result`，已作废成员的原行程号保持不变且不重新占位。
+4. **并发串行**：作废（插 `trip_voids`）与确认（读占用、复算、插
+   `confirmed_trips`）均以 `BEGIN IMMEDIATE` 获取 SQLite 保留写锁，
+   配合 `busy_timeout=30s` 两事务严格串行：确认先持锁时复算仍计入旧占用
+   （避让结果与复算一致才保存），作废先提交时确认复算已无该占用
+   （旧避让结果按 `PLAN_MISMATCH` 拒绝），任一先后次序都不会产生相互重叠
+   的有效确认行程。
 
 ### 同修订批次预排 / 确认（实现见 `app/services/batch.py`）
 
@@ -1119,11 +1323,12 @@ app/
   schemas.py            # Pydantic 模型与入参校验（窗口<=1440、航时>0 等）
   services/controls.py  # 航段分时航时管制：区间校验、整组替换、按进入分钟取实际航时
   services/groups.py    # 狭窄水道组：登记（单事务、不留半成品）、组关系读取与整组占用展开
-  services/planning.py  # 潮汐约束与时间展开 DP 规划算法（航时按进入分钟管制选定；load_occupancy 展开组占用）
+  services/voids.py     # 行程作废：非空原因作废（单事务、重复作废返回首次记录）、作废记录查询
+  services/planning.py  # 潮汐约束与时间展开 DP 规划算法（load_occupancy 跳过已作废快照并展开组占用）
   services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键；批内拟占用同步展开组占用）
-  services/reschedule.py# 更正后原行程复核与改期 DP（复核只判潮位；改期避开他人组占用且排除自身、按当前管制，只读）
-  main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/潮位更正与误差修订/单船与批次规划确认/复核改期）
-tests/                  # pytest 测试（122 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组等）
+  services/reschedule.py# 更正后原行程复核与改期 DP（复核只判潮位；改期只避开仍有效的他人快照、按当前管制，只读）
+  main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/潮位更正与误差修订/单船与批次规划确认/复核改期/行程作废与查询）
+tests/                  # pytest 测试（139 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、行程作废与并发串行等）
 Dockerfile
 docker-compose.yml
 requirements.txt

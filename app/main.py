@@ -33,12 +33,15 @@ from .schemas import (
     TideErrorRevision,
     TripOut,
     TripReviewOut,
+    TripVoidOut,
+    TripVoidRequest,
 )
 from .services.batch import confirm_batch, plan_batch
 from .services.controls import load_controls, replace_segment_controls
 from .services.groups import create_group, get_group, list_groups
 from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
+from .services.voids import get_void, void_trip
 
 
 @asynccontextmanager
@@ -571,7 +574,10 @@ def confirm_trip_batch(body: BatchConfirmRequest):
 def list_trips():
     with get_conn() as conn:
         rows = conn.execute(
-            "SELECT * FROM confirmed_trips ORDER BY trip_id"
+            "SELECT t.*, v.reason AS void_reason, v.voided_at AS voided_at"
+            " FROM confirmed_trips t"
+            " LEFT JOIN trip_voids v ON v.trip_id = t.trip_id"
+            " ORDER BY t.trip_id"
         ).fetchall()
     return [_trip_out(dict(r)) for r in rows]
 
@@ -580,12 +586,56 @@ def list_trips():
 def get_trip(trip_id: int):
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT * FROM confirmed_trips WHERE trip_id = ?", (trip_id,)
+            "SELECT t.*, v.reason AS void_reason, v.voided_at AS voided_at"
+            " FROM confirmed_trips t"
+            " LEFT JOIN trip_voids v ON v.trip_id = t.trip_id"
+            " WHERE t.trip_id = ?",
+            (trip_id,),
         ).fetchone()
     if row is None:
         raise ApiError(404, "TRIP_NOT_FOUND", f"已确认行程不存在: {trip_id}",
                        {"trip_id": trip_id})
     return _trip_out(dict(row))
+
+
+@app.post(
+    "/api/trips/{trip_id}/void",
+    response_model=TripVoidOut,
+    tags=["trips"],
+)
+def void_confirmed_trip(trip_id: int, body: TripVoidRequest):
+    """作废已确认行程（误确认纠正）。
+
+    凭行程号与非空作废原因作废：行程快照原样保留、仍可经 ``GET /api/trips``
+    查询（带作废标记），仅其按固化航时计算的航段与狭窄水道组占用从后续
+    调度（预排/确认复算/改期建议）中失效。未知行程 ``404 TRIP_NOT_FOUND``；
+    重复作废幂等返回**首次记录**（200）且不覆盖原因。作废与确认均在
+    ``BEGIN IMMEDIATE`` 事务中串行，不会产生相互重叠的有效确认行程。
+    """
+    with get_conn() as conn:
+        reason = body.reason.strip()
+        if not reason:
+            raise ApiError(422, "VALIDATION_ERROR", "作废原因不能为空白字符串",
+                           {"reason": body.reason})
+        record, created = void_trip(conn, trip_id, reason)
+    if not created:
+        return JSONResponse(status_code=200, content=record)
+    return JSONResponse(status_code=201, content=record)
+
+
+@app.get(
+    "/api/trips/{trip_id}/void",
+    response_model=TripVoidOut,
+    tags=["trips"],
+)
+def get_void_record(trip_id: int):
+    """按行程号查询作废记录。
+
+    未知行程 ``404 TRIP_NOT_FOUND``；行程存在但未作废
+    ``404 VOID_RECORD_NOT_FOUND``。
+    """
+    with get_conn() as conn:
+        return get_void(conn, trip_id)
 
 
 @app.post(
@@ -607,6 +657,7 @@ def review_trip(trip_id: int, body: Optional[ReviewRequest] = None):
 
 
 def _trip_out(d: dict) -> TripOut:
+    voided_at = d.get("voided_at")
     return TripOut(
         trip_id=d["trip_id"],
         revision=d["revision"],
@@ -620,4 +671,7 @@ def _trip_out(d: dict) -> TripOut:
         arrival_minute=d["arrival_minute"],
         itinerary=json.loads(d["itinerary"]),
         confirmed_at=d["confirmed_at"],
+        voided=voided_at is not None,
+        void_reason=d.get("void_reason"),
+        voided_at=voided_at,
     )

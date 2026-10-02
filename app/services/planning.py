@@ -80,6 +80,9 @@ def load_occupancy(conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
     原样保留——它们就是后续规划必须避开的占用。
     exclude_trip_id 用于改期复核：建议须避开其他已确认快照，但排除自身。
 
+    **已作废行程**（trip_voids 中有记录）的占用整体不计入——作废只释放其
+    固化航时占用，快照行仍保留可查。
+
     狭窄水道组：快照任一段若属于某组，该段原占用（按其固化航时）展开到
     组内全部成员航段的同一批分钟——船进入组内任一航段即独占整组。组建前
     的已确认快照同样按原航段与固化航时计入新组占用（快照不改写，组建前
@@ -87,10 +90,16 @@ def load_occupancy(conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
     """
     from .groups import expand_group_occupancy, load_groups
 
-    sql = "SELECT itinerary FROM confirmed_trips"
+    # LEFT JOIN trip_voids：已作废快照的占用从后续调度失效（快照本身仍保留在
+    # confirmed_trips 中作为历史可查），只跳过 v.trip_id IS NULL 的有效快照。
+    sql = (
+        "SELECT t.itinerary FROM confirmed_trips t"
+        " LEFT JOIN trip_voids v ON v.trip_id = t.trip_id"
+        " WHERE v.trip_id IS NULL"
+    )
     params: list = []
     if exclude_trip_id is not None:
-        sql += " WHERE trip_id <> ?"
+        sql += " AND t.trip_id <> ?"
         params.append(exclude_trip_id)
     occupied: dict[int, set[int]] = {}
     for row in conn.execute(sql, params).fetchall():
