@@ -62,6 +62,16 @@ CREATE TABLE IF NOT EXISTS batch_confirmations (
     confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 行程作废记录：每条已确认行程至多一条（trip_id 唯一）。confirmed_trips 中的
+-- 原确认快照仍作为历史快照保留可查；作废只使该行程按固化航时计算的航段及
+-- 狭窄水道组占用从后续调度中失效（load_occupancy 排除已作废行程）。
+-- 重复作废不覆盖：服务层命中既有记录直接返回首次原因/时间，唯一约束兜底并发。
+CREATE TABLE IF NOT EXISTS voided_trips (
+    trip_id     INTEGER PRIMARY KEY REFERENCES confirmed_trips(trip_id),
+    reason      TEXT NOT NULL,                              -- 非空作废原因（剥离首尾空白后至少 1 字符）
+    voided_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 航段分时航时管制：半开分钟区间 [start_minute, end_minute) 内进入航段的
 -- 船舶按 travel_time 计航时；未命中任何区间沿用 segments.travel_time 基础航时。
 -- 整组替换（同 seg_id 先全删再插），区间互不交叠由服务层保证。

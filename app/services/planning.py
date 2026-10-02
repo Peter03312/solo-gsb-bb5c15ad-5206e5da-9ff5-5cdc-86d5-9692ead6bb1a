@@ -87,10 +87,16 @@ def load_occupancy(conn, lo: int, hi: int, exclude_trip_id: Optional[int] = None
     """
     from .groups import expand_group_occupancy, load_groups
 
-    sql = "SELECT itinerary FROM confirmed_trips"
+    # 已作废行程的原确认快照仍保留在 confirmed_trips 中作为历史快照可查，
+    # 但其按固化航时计算的航段/组占用不再阻挡后续调度，故 LEFT JOIN 排除。
+    sql = (
+        "SELECT c.itinerary AS itinerary FROM confirmed_trips c"
+        " LEFT JOIN voided_trips v ON v.trip_id = c.trip_id"
+        " WHERE v.trip_id IS NULL"
+    )
     params: list = []
     if exclude_trip_id is not None:
-        sql += " WHERE trip_id <> ?"
+        sql += " AND c.trip_id <> ?"
         params.append(exclude_trip_id)
     occupied: dict[int, set[int]] = {}
     for row in conn.execute(sql, params).fetchall():

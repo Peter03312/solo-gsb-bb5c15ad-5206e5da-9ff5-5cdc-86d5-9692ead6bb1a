@@ -242,6 +242,32 @@ class TripOut(BaseModel):
     arrival_minute: int
     itinerary: list[LegOut]
     confirmed_at: str
+    voided_at: Optional[str] = Field(
+        default=None,
+        description="作废时间；未作废为 null。作废后确认快照仍作为历史快照原样可查，"
+                    "仅其占用从后续调度失效",
+    )
+
+
+# ---- 已确认行程作废（误确认撤销） ---------------------------------------------------
+
+class TripVoidRequest(BaseModel):
+    reason: str = Field(
+        min_length=1,
+        description="非空作废原因（剥离首尾空白后至少 1 个字符）；重复作废不覆盖首次原因",
+    )
+
+
+class VoidRecordOut(BaseModel):
+    trip_id: int = Field(description="被作废的已确认行程号")
+    reason: str = Field(description="首次作废时提交的非空原因（重复作废原样返回）")
+    voided_at: str = Field(description="首次作废时间")
+
+
+class TripVoidResponse(VoidRecordOut):
+    replayed: bool = Field(
+        description="true=重复作废，返回的是首次记录（HTTP 200）；首次作废为 false（HTTP 201）",
+    )
 
 
 # ---- 潮位更正后的复核 / 改期 -------------------------------------------------------
